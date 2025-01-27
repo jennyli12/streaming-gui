@@ -143,9 +143,8 @@ class Microphone:
     RATE = 44100
     MAX_BUFFER_LEN = 10 * RATE
 
-    def __init__(self, signal, global_start_time):
+    def __init__(self, signal):
         self.signal = signal
-        self.global_start_time = global_start_time
 
         self.p = pyaudio.PyAudio()
         self.wf = wave.open('microphone.wav', 'wb')
@@ -164,8 +163,8 @@ class Microphone:
         self.frames = np.concatenate((self.frames, np.frombuffer(in_data, dtype=np.int16)))[-Microphone.MAX_BUFFER_LEN:]
         self.total_frames += frame_count
 
-        start_t = self.start_time + ((self.total_frames - len(self.frames)) / Microphone.RATE) - self.global_start_time
-        end_t = self.start_time + (self.total_frames / Microphone.RATE) - self.global_start_time
+        start_t = (self.total_frames - len(self.frames)) / Microphone.RATE
+        end_t = self.total_frames / Microphone.RATE
         self.t = np.linspace(start_t, end_t, num=len(self.frames), endpoint=False)
 
         self.signal.data.emit(self.t, self.frames)
@@ -248,10 +247,12 @@ class MainWindow(QMainWindow):
             self.curves[name] = plot.plot([], [])
         
     async def start(self):
+        microphone_signal = Signal()
+        microphone_signal.data.connect(self.update_microphone_graph)
+        self.microphone = Microphone(microphone_signal)
+        global_start_time = self.microphone.start_time
+
         device = await BleakScanner.find_device_by_name("Polar Sense DE957E2E", timeout=1)
-
-        global_start_time = time.time()
-
         if device is None:
             print("Polar Sense DE957E2E not found")
         else:
@@ -262,9 +263,6 @@ class MainWindow(QMainWindow):
             print("Battery:", await self.pvs.get_battery_level())
             await self.pvs.start_ppg_stream()
 
-        microphone_signal = Signal()
-        microphone_signal.data.connect(self.update_microphone_graph)
-        self.microphone = Microphone(microphone_signal, global_start_time)
     
     @asyncClose
     async def closeEvent(self, event):
