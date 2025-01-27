@@ -12,6 +12,7 @@ import time
 import sys
 import ctypes
 import wave
+import threading
 from picosdk.ps3000a import ps3000a
 from picosdk.ps4000 import ps4000
 from picosdk.functions import assert_pico_ok
@@ -26,7 +27,7 @@ class PolarVeritySense:
     PPG_START = bytearray([0x02, 0x01, 0x00, 0x01, 0x37, 0x00, 0x01, 0x01, 0x16, 0x00, 0x04, 0x01, 0x04])
     PPG_STOP = bytearray([0x03, 0x01])
 
-    MAX_BUFFER_LEN = 20 * 55
+    MAX_EMIT_LEN = 20 * 55
 
     def __init__(self, device, signal, global_start_time):
         self.device = device
@@ -120,7 +121,7 @@ class PolarVeritySense:
                 self.t = np.concatenate((self.t, t - self.global_start_time))
                 self.previous_timestamp = timestamp
 
-                self.signal.data.emit(self.t[-PolarVeritySense.MAX_BUFFER_LEN:], self.ppg0[-PolarVeritySense.MAX_BUFFER_LEN:])
+                self.signal.data.emit(self.t[-PolarVeritySense.MAX_EMIT_LEN:], self.ppg0[-PolarVeritySense.MAX_EMIT_LEN:])
                 
                 # TODO: WRITE DATA
 
@@ -141,7 +142,7 @@ class Microphone:
     FORMAT = pyaudio.paInt16
     CHANNELS = 1 if sys.platform == 'darwin' else 2
     RATE = 44100
-    MAX_BUFFER_LEN = 10 * RATE
+    MAX_EMIT_LEN = 10 * RATE
 
     def __init__(self, signal):
         self.signal = signal
@@ -160,12 +161,10 @@ class Microphone:
         self.start_time = time.time()
 
     def callback(self, in_data, frame_count, time_info, status):
-        self.frames = np.concatenate((self.frames, np.frombuffer(in_data, dtype=np.int16)))[-Microphone.MAX_BUFFER_LEN:]
+        self.frames = np.concatenate((self.frames, np.frombuffer(in_data, dtype=np.int16)))[-Microphone.MAX_EMIT_LEN:]
         self.total_frames += frame_count
 
-        start_t = (self.total_frames - len(self.frames)) / Microphone.RATE
-        end_t = self.total_frames / Microphone.RATE
-        self.t = np.linspace(start_t, end_t, num=len(self.frames), endpoint=False)
+        self.t = np.linspace((self.total_frames - len(self.frames)) / Microphone.RATE, self.total_frames / Microphone.RATE, num=len(self.frames), endpoint=False)
 
         self.signal.data.emit(self.t, self.frames)
 
@@ -178,44 +177,227 @@ class Microphone:
         self.wf.close()
 
 
-# class PicoScope:
-#     channel_range = 8  # 10MV, 20MV, 50MV, 100MV, 200MV, 500MV, 1V, 2V, 5V, 10V, 20V, 50V
-#     v_range = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200][channel_range]
+class PicoScope:
+    channel_range = 8  # 10MV, 20MV, 50MV, 100MV, 200MV, 500MV, 1V, 2V, 5V, 10V, 20V, 50V
+    v_range = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200][channel_range]
+
+    sizeOfOneBuffer = 5000
+    numBuffersToCapture = 100
+    totalSamples = sizeOfOneBuffer * numBuffersToCapture
+
+    sampleInterval = ctypes.c_int32(200)
+    sampleUnits = 3  # FS, PS, NS, US, MS, S
+    actualSampleInterval = sampleInterval.value / 1e6
+
+    MAX_EMIT_LEN = int(1e6 / sampleInterval.value * 20)
     
-#     def __init__(self):
-#         self.chandle_4000 = ctypes.c_int16()
-#         self.status_4000 = {}
+    def __init__(self, ps, signal, global_start_time):
+        self.ps = ps
+        self.signal = signal
+        self.global_start_time = global_start_time
 
-#         self.chandle_3000a = ctypes.c_int16()
-#         self.status_3000a = {}
+        self.chandle = ctypes.c_int16()
+        self.status = {}
+
+        self.kill = False
+
+    def open(self):
+        if self.ps == ps3000a:
+            self.status["openunit"] = self.ps.ps3000aOpenUnit(ctypes.byref(self.chandle), None)
+            try:
+                assert_pico_ok(self.status["openunit"])
+            except:
+                powerStatus = self.status["openunit"]
+                if powerStatus == 286:
+                    self.status["changePowerSource"] = self.ps.ps3000aChangePowerSource(self.chandle, powerStatus)
+                elif powerStatus == 282:
+                    self.status["changePowerSource"] = self.ps.ps3000aChangePowerSource(self.chandle, powerStatus)
+                else:
+                    raise
+                assert_pico_ok(self.status["changePowerSource"])
+
+            self.status["setChA"] = self.ps.ps3000aSetChannel(self.chandle, self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_A'], 1, 1, PicoScope.channel_range, 0.0)
+            assert_pico_ok(self.status["setChA"])
+            self.status["setChB"] = self.ps.ps3000aSetChannel(self.chandle, self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_B'], 1, 1, PicoScope.channel_range, 0.0)
+            assert_pico_ok(self.status["setChB"])
+            self.status["setChC"] = self.ps.ps3000aSetChannel(self.chandle, self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_C'], 1, 1, PicoScope.channel_range, 0.0)
+            assert_pico_ok(self.status["setChC"])
+            self.status["setChD"] = self.ps.ps3000aSetChannel(self.chandle, self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_D'], 1, 1, PicoScope.channel_range, 0.0)
+            assert_pico_ok(self.status["setChD"])
+
+            self.bufferAMax = np.zeros(shape=PicoScope.sizeOfOneBuffer, dtype=np.int16)
+            self.bufferBMax = np.zeros(shape=PicoScope.sizeOfOneBuffer, dtype=np.int16)
+            self.bufferCMax = np.zeros(shape=PicoScope.sizeOfOneBuffer, dtype=np.int16)
+            self.bufferDMax = np.zeros(shape=PicoScope.sizeOfOneBuffer, dtype=np.int16)
+
+            self.status["setDataBuffersA"] = self.ps.ps3000aSetDataBuffers(
+                self.chandle,
+                self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_A'],
+                self.bufferAMax.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                None,
+                PicoScope.sizeOfOneBuffer,
+                0,
+                self.ps.PS3000A_RATIO_MODE['PS3000A_RATIO_MODE_NONE']
+            )
+            assert_pico_ok(self.status["setDataBuffersA"])
+            self.status["setDataBuffersB"] = self.ps.ps3000aSetDataBuffers(
+                self.chandle,
+                self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_B'],
+                self.bufferBMax.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                None,
+                PicoScope.sizeOfOneBuffer,
+                0,
+                self.ps.PS3000A_RATIO_MODE['PS3000A_RATIO_MODE_NONE']
+            )
+            assert_pico_ok(self.status["setDataBuffersB"])
+            self.status["setDataBuffersC"] = self.ps.ps3000aSetDataBuffers(
+                self.chandle,
+                self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_C'],
+                self.bufferCMax.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                None,
+                PicoScope.sizeOfOneBuffer,
+                0,
+                self.ps.PS3000A_RATIO_MODE['PS3000A_RATIO_MODE_NONE']
+            )
+            assert_pico_ok(self.status["setDataBuffersC"])
+            self.status["setDataBuffersD"] = self.ps.ps3000aSetDataBuffers(
+                self.chandle,
+                self.ps.PS3000A_CHANNEL['PS3000A_CHANNEL_D'],
+                self.bufferDMax.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                None,
+                PicoScope.sizeOfOneBuffer,
+                0,
+                self.ps.PS3000A_RATIO_MODE['PS3000A_RATIO_MODE_NONE']
+            )
+            assert_pico_ok(self.status["setDataBuffersD"])
+        else:
+            self.status["openunit"] = self.ps.ps4000OpenUnit(ctypes.byref(self.chandle))
+            assert_pico_ok(self.status["openunit"])
+        
+            self.status["setChA"] = self.ps.ps4000SetChannel(self.chandle, self.ps.PS4000_CHANNEL['PS4000_CHANNEL_A'], 1, 1, PicoScope.channel_range)
+            assert_pico_ok(self.status["setChA"])
+            self.status["setChB"] = self.ps.ps4000SetChannel(self.chandle, self.ps.PS4000_CHANNEL['PS4000_CHANNEL_B'], 1, 1, PicoScope.channel_range)
+            assert_pico_ok(self.status["setChB"])
+
+            self.bufferAMax = np.zeros(shape=PicoScope.sizeOfOneBuffer, dtype=np.int16)
+            self.bufferBMax = np.zeros(shape=PicoScope.sizeOfOneBuffer, dtype=np.int16)
+
+            self.status["setDataBuffersA"] = self.ps.ps4000SetDataBuffers(
+                self.chandle,
+                self.ps.PS4000_CHANNEL['PS4000_CHANNEL_A'],
+                self.bufferAMax.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                None,
+                PicoScope.sizeOfOneBuffer
+            )
+            assert_pico_ok(self.status["setDataBuffersA"])
+            self.status["setDataBuffersB"] = self.ps.ps4000SetDataBuffers(
+                self.chandle,
+                self.ps.PS4000_CHANNEL['PS4000_CHANNEL_B'],
+                self.bufferBMax.ctypes.data_as(ctypes.POINTER(ctypes.c_int16)),
+                None,
+                PicoScope.sizeOfOneBuffer
+            )
+            assert_pico_ok(self.status["setDataBuffersB"])
     
-#     def open(self):
-#         self.status_3000a["openunit"] = ps3000a.ps3000aOpenUnit(ctypes.byref(self.chandle_3000a), None)
-#         try:
-#             assert_pico_ok(self.status_3000a["openunit"])
-#         except:
-#             powerStatus = self.status_3000a["openunit"]
-#             if powerStatus == 286:
-#                 self.status_3000a["changePowerSource"] = ps3000a.ps3000aChangePowerSource(self.chandle_3000a, powerStatus)
-#             elif powerStatus == 282:
-#                 self.status_3000a["changePowerSource"] = ps3000a.ps3000aChangePowerSource(self.chandle_3000a, powerStatus)
-#             else:
-#                 raise
-#             assert_pico_ok(self.status_3000a["changePowerSource"])
+    def streaming_callback(self, handle, noOfSamples, startIndex, overflow, triggerAt, triggered, autoStop, param):
+        self.wasCalledBack = True
+        destEnd = self.nextSample + noOfSamples
+        sourceEnd = startIndex + noOfSamples
 
-#         self.status_4000["openunit"] = ps4000.ps4000OpenUnit(ctypes.byref(self.chandle_4000))
-#         assert_pico_ok(self.status_4000["openunit"])
+        self.bufferCompleteA[self.nextSample:destEnd] = self.bufferAMax[startIndex:sourceEnd]
+        self.bufferCompleteB[self.nextSample:destEnd] = self.bufferBMax[startIndex:sourceEnd]
+        self.bufferCompleteA[self.nextSample:destEnd] *= PicoScope.v_range / self.maxADC.value
+        self.bufferCompleteB[self.nextSample:destEnd] *= PicoScope.v_range / self.maxADC.value
+        if self.ps == ps3000a:
+            self.bufferCompleteC[self.nextSample:destEnd] = self.bufferCMax[startIndex:sourceEnd]
+            self.bufferCompleteD[self.nextSample:destEnd] = self.bufferDMax[startIndex:sourceEnd]
+            self.bufferCompleteC[self.nextSample:destEnd] *= PicoScope.v_range / self.maxADC.value
+            self.bufferCompleteD[self.nextSample:destEnd] *= PicoScope.v_range / self.maxADC.value
 
-#     def stop(self):
-#         self.status_4000["stop"] = ps4000.ps4000Stop(self.chandle_4000)
-#         assert_pico_ok(self.status_4000["stop"])
-#         self.status_4000["close"] = ps4000.ps4000CloseUnit(self.chandle_4000)
-#         assert_pico_ok(self.status_4000["close"])
+        self.nextSample += noOfSamples
+        if autoStop:
+            self.autoStopOuter = True
 
-#         self.status_3000a["stop"] = ps3000a.ps3000aStop(self.chandle_3000a)
-#         assert_pico_ok(self.status_3000a["stop"])
-#         self.status_3000a["close"] = ps3000a.ps3000aCloseUnit(self.chandle_3000a)
-#         assert_pico_ok(self.status_3000a["close"])
+    def run(self):
+        if self.ps == ps3000a:
+            self.status["runStreaming"] = self.ps.ps3000aRunStreaming(
+                self.chandle,
+                ctypes.byref(PicoScope.sampleInterval),
+                PicoScope.sampleUnits,
+                0,
+                PicoScope.totalSamples,
+                1,
+                1, 
+                self.ps.PS3000A_RATIO_MODE['PS3000A_RATIO_MODE_NONE'],
+                PicoScope.sizeOfOneBuffer
+            )
+        else:
+            self.status["runStreaming"] = self.ps.ps4000RunStreaming(
+                self.chandle,
+                ctypes.byref(PicoScope.sampleInterval),
+                PicoScope.sampleUnits,
+                0,
+                PicoScope.totalSamples,
+                1,
+                1,
+                PicoScope.sizeOfOneBuffer
+            )
+        assert_pico_ok(self.status["runStreaming"])
+        self.t = time.time() - self.global_start_time + np.linspace(0, (PicoScope.totalSamples - 1) * PicoScope.actualSampleInterval, num=PicoScope.totalSamples)
+        print(self.ps.name + ": Capturing at", 1 / PicoScope.actualSampleInterval, "Hz for", PicoScope.totalSamples * PicoScope.actualSampleInterval, "s")
+            
+        self.bufferCompleteA = np.zeros(shape=PicoScope.totalSamples)
+        self.bufferCompleteB = np.zeros(shape=PicoScope.totalSamples)
+        if self.ps == ps3000a:
+            self.bufferCompleteC = np.zeros(shape=PicoScope.totalSamples)
+            self.bufferCompleteD = np.zeros(shape=PicoScope.totalSamples)
+
+        self.nextSample = 0
+        self.autoStopOuter = False
+        self.wasCalledBack = False
+
+        if self.ps == ps3000a:
+            self.maxADC = ctypes.c_int16()
+            self.status["maximumValue"] = self.ps.ps3000aMaximumValue(self.chandle, ctypes.byref(self.maxADC))
+            assert_pico_ok(self.status["maximumValue"])
+        else:
+            self.maxADC = ctypes.c_int16(32767)
+
+        self.cFuncPtr = self.ps.StreamingReadyType(self.streaming_callback)
+
+        while self.nextSample < self.totalSamples and not self.autoStopOuter and not self.kill:
+            self.wasCalledBack = False
+            if self.ps == ps3000a:
+                self.status["getStreamingLatestValues"] = self.ps.ps3000aGetStreamingLatestValues(self.chandle, self.cFuncPtr, None) 
+                if self.wasCalledBack:
+                    self.signal.data.emit(
+                        self.t[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample],
+                        np.stack((self.bufferCompleteA, self.bufferCompleteB, self.bufferCompleteC, self.bufferCompleteD))[:, max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample]
+                    )
+                else:
+                    time.sleep(0.01)
+            else:
+                self.status["getStreamingLatestValues"] = self.ps.ps4000GetStreamingLatestValues(self.chandle, self.cFuncPtr, None) 
+                if self.wasCalledBack:
+                    self.signal.data.emit(
+                        self.t[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample],
+                        np.stack((self.bufferCompleteA, self.bufferCompleteB))[:, max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample]
+                    )
+                else:
+                    time.sleep(0.01)
+
+        if self.ps == ps3000a:
+            self.status["stop"] = self.ps.ps3000aStop(self.chandle)
+            assert_pico_ok(self.status["stop"])
+            self.status["close"] = self.ps.ps3000aCloseUnit(self.chandle)
+            assert_pico_ok(self.status["close"])
+            print(self.status)
+        else:
+            self.status["stop"] = self.ps.ps4000Stop(self.chandle)
+            assert_pico_ok(self.status["stop"])
+            self.status["close"] = self.ps.ps4000CloseUnit(self.chandle)
+            assert_pico_ok(self.status["close"])
+            print(self.status)
 
 
 class Signal(QObject):
@@ -229,22 +411,40 @@ class MainWindow(QMainWindow):
 
         self.pvs = None
         self.microphone = None
+        self.ps4000 = None
+        self.ps3000a = None
 
         self.graphWidget = pg.GraphicsLayoutWidget()
         self.setCentralWidget(self.graphWidget)
 
         self.plots = {
             "PPG0": self.graphWidget.addPlot(row=0, col=0),
-            "Microphone": self.graphWidget.addPlot(row=1, col=0)
+            "Microphone": self.graphWidget.addPlot(row=1, col=0),
+            "1A": self.graphWidget.addPlot(row=2, col=0),
+            "1B": self.graphWidget.addPlot(row=3, col=0),
+            "2A": self.graphWidget.addPlot(row=4, col=0),
+            "2B": self.graphWidget.addPlot(row=5, col=0),
+            "2C": self.graphWidget.addPlot(row=6, col=0),
+            "2D": self.graphWidget.addPlot(row=7, col=0)
         }
 
         self.curves = {}
         for name, plot in self.plots.items():
             plot.setLabel("left", name)
             plot.setMouseEnabled(x=False, y=False)
+
             if name != "Microphone":
                 plot.setXLink(self.plots["Microphone"])
-            self.curves[name] = plot.plot([], [])
+
+            if name[0] == "1":
+                self.curves[name] = plot.plot([], [], pen=(225, 109, 103))
+            elif name[0] == "2":
+                self.curves[name] = plot.plot([], [], pen=(62, 167, 160))
+            else:
+                self.curves[name] = plot.plot([], [], pen=(63, 169, 217))
+            
+            if name != "PPG0":
+                self.curves[name].setDownsampling(ds=50, method='peak')
         
     async def start(self):
         microphone_signal = Signal()
@@ -252,7 +452,7 @@ class MainWindow(QMainWindow):
         self.microphone = Microphone(microphone_signal)
         global_start_time = self.microphone.start_time
 
-        device = await BleakScanner.find_device_by_name("Polar Sense DE957E2E", timeout=1)
+        device = await BleakScanner.find_device_by_name("Polar Sense DE957E2E", timeout=3)
         if device is None:
             print("Polar Sense DE957E2E not found")
         else:
@@ -262,7 +462,34 @@ class MainWindow(QMainWindow):
             await self.pvs.connect()
             print("Battery:", await self.pvs.get_battery_level())
             await self.pvs.start_ppg_stream()
+        
+        ps4000_signal = Signal()
+        ps4000_signal.data.connect(self.update_ps4000_graph)
+        self.ps4000 = PicoScope(ps4000, ps4000_signal, global_start_time)
 
+        ps3000a_signal = Signal()
+        ps3000a_signal.data.connect(self.update_ps3000a_graph)
+        self.ps3000a = PicoScope(ps3000a, ps3000a_signal, global_start_time)
+
+        t1 = threading.Thread(target=self.run_ps4000)
+        t1.start()
+        
+        t2 = threading.Thread(target=self.run_ps3000a)
+        t2.start()
+    
+    def run_ps4000(self):
+        try:
+            self.ps4000.open()
+            self.ps4000.run()
+        except Exception as e:
+            print("ps4000 failed: ", e)
+    
+    def run_ps3000a(self):
+        try:
+            self.ps3000a.open()
+            self.ps3000a.run()
+        except Exception as e:
+            print("ps3000a failed: ", e)
     
     @asyncClose
     async def closeEvent(self, event):
@@ -271,12 +498,26 @@ class MainWindow(QMainWindow):
             await self.pvs.disconnect()
         if self.microphone is not None:
             self.microphone.close()
+        if self.ps4000 is not None:
+            self.ps4000.kill = True
+        if self.ps3000a is not None:
+            self.ps3000a.kill = True
     
     def update_pvs_graph(self, t, ppg0):
         self.curves["PPG0"].setData(t, ppg0)
 
     def update_microphone_graph(self, t, frames):
-        self.curves["Microphone"].setData(t, frames) 
+        self.curves["Microphone"].setData(t, frames)
+    
+    def update_ps4000_graph(self, t, buffers):
+        self.curves["1A"].setData(t, buffers[0])
+        self.curves["1B"].setData(t, buffers[1])
+
+    def update_ps3000a_graph(self, t, buffers):
+        self.curves["2A"].setData(t, buffers[0])
+        self.curves["2B"].setData(t, buffers[1])
+        self.curves["2C"].setData(t, buffers[2])
+        self.curves["2D"].setData(t, buffers[3])
 
 
 if __name__ == "__main__":
