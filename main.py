@@ -13,6 +13,7 @@ import sys
 import ctypes
 import wave
 import threading
+import os
 from picosdk.ps3000a import ps3000a
 from picosdk.ps4000 import ps4000
 from picosdk.functions import assert_pico_ok
@@ -29,10 +30,11 @@ class PolarVeritySense:
 
     MAX_EMIT_LEN = 20 * 55
 
-    def __init__(self, device, signal, global_start_time):
+    def __init__(self, device, signal, global_start_time, session_dir):
         self.device = device
         self.signal = signal
         self.global_start_time = global_start_time
+        self.session_dir = session_dir
 
         self.connected = False
         self.started = False
@@ -73,6 +75,7 @@ class PolarVeritySense:
             await self.client.write_gatt_char(PolarVeritySense.PMD_CONTROL, PolarVeritySense.PPG_STOP)
             self.started = False
             print("Stopping PPG stream")
+            np.save(self.session_dir + "/pvs" , np.stack((self.t, self.ppg0, self.ppg1, self.ppg2, self.ambient), axis=1), allow_pickle=False)
 
     def decode_data(self, sender, data):
         if data[0] != 0x01:
@@ -121,9 +124,7 @@ class PolarVeritySense:
                 self.t = np.concatenate((self.t, t - self.global_start_time))
                 self.previous_timestamp = timestamp
 
-                self.signal.data.emit(self.t[-PolarVeritySense.MAX_EMIT_LEN:], self.ppg0[-PolarVeritySense.MAX_EMIT_LEN:])
-                
-                # TODO: WRITE DATA
+                self.signal.data.emit(np.stack((self.t, self.ppg0), axis=1)[-PolarVeritySense.MAX_EMIT_LEN:])
 
     @staticmethod
     def convert_array_to_signed_int(data, offset, length):
@@ -144,11 +145,11 @@ class Microphone:
     RATE = 44100
     MAX_EMIT_LEN = 10 * RATE
 
-    def __init__(self, signal):
+    def __init__(self, signal, session_dir):
         self.signal = signal
 
         self.p = pyaudio.PyAudio()
-        self.wf = wave.open('microphone.wav', 'wb')
+        self.wf = wave.open(session_dir + '/microphone.wav', 'wb')
         self.wf.setnchannels(Microphone.CHANNELS)
         self.wf.setsampwidth(self.p.get_sample_size(Microphone.FORMAT))
         self.wf.setframerate(Microphone.RATE)
@@ -166,7 +167,7 @@ class Microphone:
 
         self.t = np.linspace((self.total_frames - len(self.frames)) / Microphone.RATE, self.total_frames / Microphone.RATE, num=len(self.frames), endpoint=False)
 
-        self.signal.data.emit(self.t, self.frames)
+        self.signal.data.emit(np.stack((self.t, self.frames), axis=1))
 
         self.wf.writeframes(in_data)
         return (in_data, pyaudio.paContinue)
@@ -191,10 +192,11 @@ class PicoScope:
 
     MAX_EMIT_LEN = int(1e6 / sampleInterval.value * 20)
     
-    def __init__(self, ps, signal, global_start_time):
+    def __init__(self, ps, signal, global_start_time, session_dir):
         self.ps = ps
         self.signal = signal
         self.global_start_time = global_start_time
+        self.session_dir = session_dir
 
         self.chandle = ctypes.c_int16()
         self.status = {}
@@ -370,19 +372,13 @@ class PicoScope:
             if self.ps == ps3000a:
                 self.status["getStreamingLatestValues"] = self.ps.ps3000aGetStreamingLatestValues(self.chandle, self.cFuncPtr, None) 
                 if self.wasCalledBack:
-                    self.signal.data.emit(
-                        self.t[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample],
-                        np.stack((self.bufferCompleteA, self.bufferCompleteB, self.bufferCompleteC, self.bufferCompleteD))[:, max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample]
-                    )
+                    self.signal.data.emit(np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB, self.bufferCompleteC, self.bufferCompleteD), axis=1)[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample])
                 else:
                     time.sleep(0.01)
             else:
                 self.status["getStreamingLatestValues"] = self.ps.ps4000GetStreamingLatestValues(self.chandle, self.cFuncPtr, None) 
                 if self.wasCalledBack:
-                    self.signal.data.emit(
-                        self.t[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample],
-                        np.stack((self.bufferCompleteA, self.bufferCompleteB))[:, max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample]
-                    )
+                    self.signal.data.emit(np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB), axis=1)[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample])
                 else:
                     time.sleep(0.01)
 
@@ -392,16 +388,18 @@ class PicoScope:
             self.status["close"] = self.ps.ps3000aCloseUnit(self.chandle)
             assert_pico_ok(self.status["close"])
             print(self.status)
+            np.save(self.session_dir + "/" + self.ps.name, np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB, self.bufferCompleteC, self.bufferCompleteD), axis=1), allow_pickle=False)
         else:
             self.status["stop"] = self.ps.ps4000Stop(self.chandle)
             assert_pico_ok(self.status["stop"])
             self.status["close"] = self.ps.ps4000CloseUnit(self.chandle)
             assert_pico_ok(self.status["close"])
             print(self.status)
+            np.save(self.session_dir + "/" + self.ps.name, np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB), axis=1), allow_pickle=False)
 
 
 class Signal(QObject):
-    data = pyqtSignal(object, object)
+    data = pyqtSignal(object)
 
 
 class MainWindow(QMainWindow):
@@ -447,9 +445,17 @@ class MainWindow(QMainWindow):
                 self.curves[name].setDownsampling(ds=50, method='peak')
         
     async def start(self):
+        i = 1
+        while True:
+            session_dir = f"session-{i:02d}"
+            if not os.path.exists(session_dir):
+                os.makedirs(session_dir)
+                break
+            i += 1
+
         microphone_signal = Signal()
         microphone_signal.data.connect(self.update_microphone_graph)
-        self.microphone = Microphone(microphone_signal)
+        self.microphone = Microphone(microphone_signal, session_dir)
         global_start_time = self.microphone.start_time
 
         device = await BleakScanner.find_device_by_name("Polar Sense DE957E2E", timeout=3)
@@ -458,18 +464,18 @@ class MainWindow(QMainWindow):
         else:
             pvs_signal = Signal()
             pvs_signal.data.connect(self.update_pvs_graph)
-            self.pvs = PolarVeritySense(device, pvs_signal, global_start_time)
+            self.pvs = PolarVeritySense(device, pvs_signal, global_start_time, session_dir)
             await self.pvs.connect()
             print("Battery:", await self.pvs.get_battery_level())
             await self.pvs.start_ppg_stream()
         
         ps4000_signal = Signal()
         ps4000_signal.data.connect(self.update_ps4000_graph)
-        self.ps4000 = PicoScope(ps4000, ps4000_signal, global_start_time)
+        self.ps4000 = PicoScope(ps4000, ps4000_signal, global_start_time, session_dir)
 
         ps3000a_signal = Signal()
         ps3000a_signal.data.connect(self.update_ps3000a_graph)
-        self.ps3000a = PicoScope(ps3000a, ps3000a_signal, global_start_time)
+        self.ps3000a = PicoScope(ps3000a, ps3000a_signal, global_start_time, session_dir)
 
         t1 = threading.Thread(target=self.run_ps4000)
         t1.start()
@@ -503,21 +509,21 @@ class MainWindow(QMainWindow):
         if self.ps3000a is not None:
             self.ps3000a.kill = True
     
-    def update_pvs_graph(self, t, ppg0):
-        self.curves["PPG0"].setData(t, ppg0)
+    def update_pvs_graph(self, data):
+        self.curves["PPG0"].setData(data[:, 0], data[:, 1])
 
-    def update_microphone_graph(self, t, frames):
-        self.curves["Microphone"].setData(t, frames)
+    def update_microphone_graph(self, data):
+        self.curves["Microphone"].setData(data[:, 0], data[:, 1])
     
-    def update_ps4000_graph(self, t, buffers):
-        self.curves["1A"].setData(t, buffers[0])
-        self.curves["1B"].setData(t, buffers[1])
+    def update_ps4000_graph(self, data):
+        self.curves["1A"].setData(data[:, 0], data[:, 1])
+        self.curves["1B"].setData(data[:, 0], data[:, 2])
 
-    def update_ps3000a_graph(self, t, buffers):
-        self.curves["2A"].setData(t, buffers[0])
-        self.curves["2B"].setData(t, buffers[1])
-        self.curves["2C"].setData(t, buffers[2])
-        self.curves["2D"].setData(t, buffers[3])
+    def update_ps3000a_graph(self, data):
+        self.curves["2A"].setData(data[:, 0], data[:, 1])
+        self.curves["2B"].setData(data[:, 0], data[:, 2])
+        self.curves["2C"].setData(data[:, 0], data[:, 3])
+        self.curves["2D"].setData(data[:, 0], data[:, 4])
 
 
 if __name__ == "__main__":
