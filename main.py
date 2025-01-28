@@ -1,7 +1,6 @@
 import asyncio
 from bleak import BleakClient, BleakScanner
 import numpy as np
-# import matplotlib.pyplot as plt
 from bitstring import BitArray
 from PyQt5.QtWidgets import QApplication, QMainWindow
 from PyQt5.QtCore import pyqtSignal, QObject
@@ -81,8 +80,10 @@ class PolarVeritySense:
         if data[0] != 0x01:
             print("Unexpected measurement type")
         else:
-            timestamp = PolarVeritySense.convert_to_unsigned_long(data, 1, 8) / 1e9 + 946684800 + 3.5  # empirically determined
+            timestamp = PolarVeritySense.convert_to_unsigned_long(data, 1, 8) / 1e9 + 946684800 + 4.4  # empirically determined
             frame_type = data[9]
+
+            # print(time.time() - timestamp)  # approx. 0.5
 
             if frame_type != 0x80:
                 print("Unexpected frame type")
@@ -345,8 +346,8 @@ class PicoScope:
                 PicoScope.sizeOfOneBuffer
             )
         assert_pico_ok(self.status["runStreaming"])
-        self.t = time.time() - self.global_start_time + np.linspace(0, (PicoScope.totalSamples - 1) * PicoScope.actualSampleInterval, num=PicoScope.totalSamples)
         print(self.ps.name + ": Capturing at", 1 / PicoScope.actualSampleInterval, "Hz for", PicoScope.totalSamples * PicoScope.actualSampleInterval, "s")
+        self.t = time.time() - self.global_start_time + np.linspace(0, (PicoScope.totalSamples - 1) * PicoScope.actualSampleInterval, num=PicoScope.totalSamples)
             
         self.bufferCompleteA = np.zeros(shape=PicoScope.totalSamples)
         self.bufferCompleteB = np.zeros(shape=PicoScope.totalSamples)
