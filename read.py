@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import wave
 
-SESSION_DIR = "session-03"
+SESSION_DIR = "session-01"
 
 ps4000 = np.load(SESSION_DIR + "/ps4000.npy")
 t1 = ps4000[:, 0]

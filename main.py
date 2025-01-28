@@ -18,6 +18,10 @@ from picosdk.ps4000 import ps4000
 from picosdk.functions import assert_pico_ok
 
 
+DISPLAY_TIME = 10
+SAVE_TIME = 300
+
+
 class PolarVeritySense:
     BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 
@@ -27,7 +31,7 @@ class PolarVeritySense:
     PPG_START = bytearray([0x02, 0x01, 0x00, 0x01, 0x37, 0x00, 0x01, 0x01, 0x16, 0x00, 0x04, 0x01, 0x04])
     PPG_STOP = bytearray([0x03, 0x01])
 
-    MAX_EMIT_LEN = 20 * 55
+    MAX_EMIT_LEN = DISPLAY_TIME * 2 * 55
 
     def __init__(self, device, signal, global_start_time, session_dir):
         self.device = device
@@ -40,6 +44,9 @@ class PolarVeritySense:
 
         self.previous_timestamp = -1
         self.t = []
+
+        self.save_t = 0
+        self.save_index = 0
 
         self.ppg0 = []
         self.ppg1 = []
@@ -127,6 +134,15 @@ class PolarVeritySense:
 
                 self.signal.data.emit(np.stack((self.t, self.ppg0), axis=1)[-PolarVeritySense.MAX_EMIT_LEN:])
 
+                if self.t[-1] > self.save_t + SAVE_TIME:
+                    np.save(
+                        self.session_dir + "/tmp/pvs_" + str(self.save_t),
+                        np.stack((self.t, self.ppg0, self.ppg1, self.ppg2, self.ambient), axis=1)[self.save_index:],
+                        allow_pickle=False
+                    )
+                    self.save_t += SAVE_TIME
+                    self.save_index = len(self.t)
+
     @staticmethod
     def convert_array_to_signed_int(data, offset, length):
         return int.from_bytes(
@@ -144,7 +160,7 @@ class Microphone:
     FORMAT = pyaudio.paInt16
     CHANNELS = 1 if sys.platform == 'darwin' else 2
     RATE = 44100
-    MAX_EMIT_LEN = 10 * RATE
+    MAX_EMIT_LEN = DISPLAY_TIME * RATE
 
     def __init__(self, signal, session_dir):
         self.signal = signal
@@ -184,14 +200,14 @@ class PicoScope:
     v_range = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200][channel_range]
 
     sizeOfOneBuffer = 5000
-    numBuffersToCapture = 100
+    numBuffersToCapture = 1800
     totalSamples = sizeOfOneBuffer * numBuffersToCapture
 
     sampleInterval = ctypes.c_int32(200)
     sampleUnits = 3  # FS, PS, NS, US, MS, S
     actualSampleInterval = sampleInterval.value / 1e6
 
-    MAX_EMIT_LEN = int(1e6 / sampleInterval.value * 20)
+    MAX_EMIT_LEN = int(1e6 / sampleInterval.value * DISPLAY_TIME * 2)
     
     def __init__(self, ps, signal, global_start_time, session_dir):
         self.ps = ps
@@ -348,7 +364,9 @@ class PicoScope:
         assert_pico_ok(self.status["runStreaming"])
         print(self.ps.name + ": Capturing at", 1 / PicoScope.actualSampleInterval, "Hz for", PicoScope.totalSamples * PicoScope.actualSampleInterval, "s")
         self.t = time.time() - self.global_start_time + np.linspace(0, (PicoScope.totalSamples - 1) * PicoScope.actualSampleInterval, num=PicoScope.totalSamples)
-            
+        self.save_t = 0
+        self.save_index = 0
+
         self.bufferCompleteA = np.zeros(shape=PicoScope.totalSamples)
         self.bufferCompleteB = np.zeros(shape=PicoScope.totalSamples)
         if self.ps == ps3000a:
@@ -373,13 +391,31 @@ class PicoScope:
             if self.ps == ps3000a:
                 self.status["getStreamingLatestValues"] = self.ps.ps3000aGetStreamingLatestValues(self.chandle, self.cFuncPtr, None) 
                 if self.wasCalledBack:
-                    self.signal.data.emit(np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB, self.bufferCompleteC, self.bufferCompleteD), axis=1)[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample])
+                    data = np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB, self.bufferCompleteC, self.bufferCompleteD), axis=1)
+                    self.signal.data.emit(data[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample])
+                    if self.t[self.nextSample - 1] > self.save_t + SAVE_TIME:
+                        np.save(
+                            self.session_dir + "/tmp/ps3000a_" + str(self.save_t),
+                            data[self.save_index:self.nextSample],
+                            allow_pickle=False
+                        )
+                        self.save_t += SAVE_TIME
+                        self.save_index = self.nextSample
                 else:
                     time.sleep(0.01)
             else:
                 self.status["getStreamingLatestValues"] = self.ps.ps4000GetStreamingLatestValues(self.chandle, self.cFuncPtr, None) 
                 if self.wasCalledBack:
-                    self.signal.data.emit(np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB), axis=1)[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample])
+                    data = np.stack((self.t, self.bufferCompleteA, self.bufferCompleteB), axis=1)
+                    self.signal.data.emit(data[max(0, self.nextSample - PicoScope.MAX_EMIT_LEN):self.nextSample])
+                    if self.t[self.nextSample - 1] > self.save_t + SAVE_TIME:
+                        np.save(
+                            self.session_dir + "/tmp/ps4000_" + str(self.save_t),
+                            data[self.save_index:self.nextSample],
+                            allow_pickle=False
+                        )
+                        self.save_t += SAVE_TIME
+                        self.save_index = self.nextSample
                 else:
                     time.sleep(0.01)
 
@@ -451,6 +487,7 @@ class MainWindow(QMainWindow):
             session_dir = f"session-{i:02d}"
             if not os.path.exists(session_dir):
                 os.makedirs(session_dir)
+                os.makedirs(session_dir + "/tmp")
                 break
             i += 1
 
